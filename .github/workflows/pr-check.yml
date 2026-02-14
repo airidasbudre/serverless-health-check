@@ -1,0 +1,235 @@
+name: Pull Request Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - 'lambda/**'
+      - '.github/workflows/**'
+
+# Allow only one PR check per PR at a time
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write  # Needed to comment on PRs
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_VERSION: 1.7.0
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  validate:
+    name: Validation & Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init (for validation)
+        working-directory: terraform
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+      - name: Run tfsec
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform
+          soft_fail: true
+          additional_args: --minimum-severity HIGH --format lovely
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12.2764.0
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: true
+          compact: true
+          output_format: cli
+
+      - name: Lint Lambda code with flake8
+        run: |
+          pip install flake8
+          flake8 lambda/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 lambda/ --count --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run pip-audit on Lambda dependencies
+        id: pip_audit
+        run: |
+          pip install pip-audit
+          pip-audit -r lambda/requirements.txt
+        continue-on-error: true
+
+      - name: Check Lambda dependencies
+        run: |
+          echo "## Lambda Dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat lambda/requirements.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## PR Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform Format | ${{ steps.fmt.outcome == 'success' && '✓ Passed' || '✗ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform Validate | ${{ steps.validate.outcome == 'success' && '✓ Passed' || '✗ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| tfsec Security Scan | ${{ steps.tfsec.outcome == 'success' && '✓ Passed' || '⚠ Warnings' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Checkov Security Scan | ${{ steps.checkov.outcome == 'success' && '✓ Passed' || '⚠ Warnings' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| pip-audit | ${{ steps.pip_audit.outcome == 'success' && '✓ Passed' || '⚠ Warnings' }} |" >> $GITHUB_STEP_SUMMARY
+
+  plan:
+    name: Terraform Plan (Staging Preview)
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 15
+    # Only run if AWS credentials are configured (optional for public repos)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Package Lambda function
+        run: |
+          echo "Installing Lambda dependencies..."
+          cd lambda
+          pip install -r requirements.txt -t package/
+
+          echo "Creating deployment package..."
+          cd package
+          zip -r ../../terraform/lambda.zip . -x "*.pyc" -x "*__pycache__*"
+
+          cd ..
+          zip ../terraform/lambda.zip health_check.py
+
+          echo "Lambda package size:"
+          ls -lh ../terraform/lambda.zip
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-PR-${{ github.event.pull_request.number }}
+        continue-on-error: true
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/health-check/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform
+        run: |
+          terraform plan -var-file=staging.tfvars -no-color -out=tfplan 2>&1 | tee plan.txt
+          echo "PLAN_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Comment PR with plan
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planPath = 'terraform/plan.txt';
+
+            let planOutput = 'Plan not available';
+            if (fs.existsSync(planPath)) {
+              planOutput = fs.readFileSync(planPath, 'utf8');
+              // Truncate if too long for comment
+              if (planOutput.length > 60000) {
+                planOutput = planOutput.substring(0, 60000) + '\n\n... (truncated)';
+              }
+            }
+
+            const output = `#### Terraform Plan (Staging Preview) 📋
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${planOutput}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Plan (Staging Preview)')
+            });
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              });
+            }
